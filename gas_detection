@@ -1,0 +1,436 @@
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "mqtt_client.h"
+#include "cJSON.h"
+
+
+
+#define GAS_SENSOR_PIN ADC_CHANNEL_6
+#define GAS_ADC_UNIT   ADC_UNIT_1
+
+#define GAS_WARNING_THRESHOLD 400
+#define GAS_DANGER_THRESHOLD 600
+
+#define LED_GREEN_PIN  GPIO_NUM_22
+#define LED_YELLOW_PIN GPIO_NUM_21
+#define LED_RED_PIN    GPIO_NUM_19
+#define FLAME_SENSOR_PIN  GPIO_NUM_23 
+#define BUTTON_PIN GPIO_NUM_18  
+bool system_enabled = true;
+
+#define WIFI_SSID "CAMTECH-GUEST"
+#define WIFI_PASS "2!CamTech!@$"
+#define M_BROKER_URL "mqtt://demo.thingsboard.io"
+#define M_ACCES_TOKEN "fcF3ODdfw05xLbqB7bPe"
+
+
+
+#define TAG "GAS_SENSOR"
+
+bool gas_alert_sent = false;
+bool flame_alert_sent = false;
+
+static adc_oneshot_unit_handle_t gasAdcHandler = NULL;
+static adc_cali_handle_t gasCaliHandler = NULL;
+
+float gas_ppm = 0;
+bool alarm_enabled = true;
+bool flame_detected = false;
+
+TaskHandle_t gasTaskHandle = NULL;
+TaskHandle_t alarmTaskHandle = NULL;
+TaskHandle_t cloud_task = NULL;
+
+esp_mqtt_client_handle_t client = NULL;
+
+
+void fx_cloud_task_run(void);
+//global variabal 
+bool is_mqtt_start = false;
+bool is_cloud_start = false;
+
+
+// Initialize LEDs
+void fx_init_alarm(void){
+    gpio_config_t io_conf = {};
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask = (1ULL << LED_GREEN_PIN) |
+                           (1ULL << LED_YELLOW_PIN) |
+                           (1ULL << LED_RED_PIN);
+    io_conf.pull_down_en = 0;
+    io_conf.pull_up_en = 0;
+    gpio_config(&io_conf);
+}
+
+// Turn off all LEDs
+void fx_disable_all(void){
+    gpio_set_level(LED_GREEN_PIN, 0);
+    gpio_set_level(LED_YELLOW_PIN, 0);
+    gpio_set_level(LED_RED_PIN, 0);
+}
+
+// Initialize gas sensor (ADC + calibration)
+void fx_init_gas_sensor(void){
+    adc_oneshot_unit_init_cfg_t adcConfig = {};
+    adcConfig.clk_src = ADC_RTC_CLK_SRC_DEFAULT;
+    adcConfig.ulp_mode = ADC_ULP_MODE_DISABLE;
+    adcConfig.unit_id = GAS_ADC_UNIT;
+    adc_oneshot_new_unit(&adcConfig, &gasAdcHandler);
+
+    adc_oneshot_chan_cfg_t chanConfig = {};
+    chanConfig.atten = ADC_ATTEN_DB_11;  // full-scale for MQ2
+    chanConfig.bitwidth = ADC_BITWIDTH_12;
+    adc_oneshot_config_channel(gasAdcHandler, GAS_SENSOR_PIN, &chanConfig);
+
+    adc_cali_line_fitting_config_t caliConfig = {};
+    caliConfig.atten = ADC_ATTEN_DB_11;
+    caliConfig.bitwidth = ADC_BITWIDTH_12;
+    caliConfig.unit_id = GAS_ADC_UNIT;
+    caliConfig.default_vref = 1100;
+    adc_cali_create_scheme_line_fitting(&caliConfig, &gasCaliHandler);
+}
+
+// Set alarm LEDs and buzzer based on gas level
+void fx_set_alarm(void){
+if (flame_detected) {
+    // Fire or dangerous gas
+    gpio_set_level(LED_RED_PIN, 1);
+    gpio_set_level(LED_YELLOW_PIN, 0);
+    gpio_set_level(LED_GREEN_PIN, 0);
+
+}
+else if(gas_ppm >= GAS_DANGER_THRESHOLD) {
+    // Danger gas level
+    gpio_set_level(LED_RED_PIN, 1);
+    gpio_set_level(LED_YELLOW_PIN, 0);
+    gpio_set_level(LED_GREEN_PIN, 0);
+
+}
+else if (gas_ppm >= GAS_WARNING_THRESHOLD) {
+    // Gas warning only
+    gpio_set_level(LED_RED_PIN, 0);
+    gpio_set_level(LED_YELLOW_PIN, 1);
+    gpio_set_level(LED_GREEN_PIN, 0);
+}
+else {
+    gpio_set_level(LED_RED_PIN, 0);
+    gpio_set_level(LED_YELLOW_PIN, 0);
+    gpio_set_level(LED_GREEN_PIN, 1);
+}
+}
+
+void fx_init_flame_sensor(void) {
+    gpio_config_t io_conf = {};
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = (1ULL << FLAME_SENSOR_PIN);
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;  
+    gpio_config(&io_conf);
+}
+
+void fx_flame_task(void *param) {
+    while (1) {
+        int flame_val = gpio_get_level(FLAME_SENSOR_PIN);
+
+        // 0 = flame detected (active low)
+        if (flame_val == 0) {
+            flame_detected = true;
+            ESP_LOGI(TAG, "FLAME DETECTED!");
+        } else {
+            flame_detected = false;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+
+// Task to read gas sensor
+void fx_gas_task(void *param){
+    while(1){
+        if(system_enabled){   // check machine status
+            int raw_adc = 0;
+            int voltage_mV = 0;
+            adc_oneshot_read(gasAdcHandler, GAS_SENSOR_PIN, &raw_adc);
+            adc_cali_raw_to_voltage(gasCaliHandler, raw_adc, &voltage_mV);
+            gas_ppm = (float)voltage_mV / 3300.0 * 3000.0;
+            ESP_LOGI(TAG, "Gas ppm: %.1f", gas_ppm);
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+// Task to manage alarm
+void fx_alarm_task(void *param){
+    while(1){
+        if(system_enabled){      // Only control LEDs if system is ON
+            if(alarm_enabled){
+                fx_set_alarm();
+            } else {
+                fx_disable_all();
+            }
+        } else {                 // System OFF → all LEDs off
+            fx_disable_all();
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+void fx_button_task(void *param) {
+    gpio_config_t io_conf = {};
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = (1ULL << BUTTON_PIN);
+    io_conf.pull_down_en = 1;   // use internal pull-down
+    io_conf.pull_up_en = 0;
+    gpio_config(&io_conf);
+
+    bool last_state = 0;
+    while(1) {
+        bool btn_state = gpio_get_level(BUTTON_PIN);
+        if(btn_state && !last_state) {  // rising edge detected
+            system_enabled = !system_enabled; // toggle system
+            ESP_LOGI(TAG, "System %s", system_enabled ? "ON" : "OFF");
+        }
+        last_state = btn_state;
+        vTaskDelay(pdMS_TO_TICKS(50)); 
+    }
+}
+
+//Connectivity part
+static void my_wifi_event(void* arg, esp_event_base_t event_base,int32_t event_id, void* event_data){
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+
+        //start connecting to wifi
+        esp_wifi_connect();
+
+    }else if(event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED){
+
+        //wifi connect sucess
+        ESP_LOGI(TAG,"wifi connect sucess");
+
+    }else if(event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED){
+
+        //wifi reconnect
+        if(is_mqtt_start){
+            esp_mqtt_client_stop(client);
+            is_mqtt_start = false;
+            ESP_LOGE(TAG,"mqtt client stop........");
+        }
+        
+
+        ESP_LOGI(TAG,"wifi disconnect ");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        esp_wifi_connect();
+        
+    }
+
+}
+
+static void my_ip_event(void* arg, esp_event_base_t event_base,int32_t event_id, void* event_data){
+
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+
+        //start connecting to wifi
+        ESP_LOGI(TAG, "ESP got ip sucess");
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+
+        //start mqtt client
+        if (!is_mqtt_start){
+            esp_mqtt_client_start(client);
+            is_mqtt_start = true;
+            ESP_LOGE(TAG,"mqtt client start........");
+        }
+        
+
+
+    }else if(event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
+
+        //start connecting to wifi
+        ESP_LOGE(TAG, "ESP lost ip");
+
+    }
+}
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data){
+    if (event_id == MQTT_EVENT_CONNECTED) {
+        ESP_LOGE(TAG, "mqtt connect to broker sucess....");
+        if (cloud_task != NULL && !is_cloud_start) {
+            vTaskResume(cloud_task);
+            is_cloud_start = true;
+            ESP_LOGE(TAG, "cloud task resume........");
+        }
+    } else if (event_id == MQTT_EVENT_DISCONNECTED) {
+        ESP_LOGE(TAG, "mqtt disconnect from broker ....");
+        if (cloud_task != NULL && is_cloud_start) {
+            vTaskSuspend(cloud_task);
+            is_cloud_start = false;
+            ESP_LOGE(TAG, "cloud task suspend........");
+        }
+    }
+}
+void mqtt_send_telemetry(float gas, bool flame) {
+    if (!client) return;
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "gas_ppm", gas);
+    cJSON_AddBoolToObject(root, "flame", flame);
+
+    char *json_str = cJSON_PrintUnformatted(root);
+    esp_mqtt_client_publish(client, "v1/devices/me/telemetry", json_str, 0, 1, 0);
+
+    ESP_LOGI(TAG, "Published telemetry: %s", json_str);
+
+    cJSON_Delete(root);
+    free(json_str);
+}
+void fx_mqtt_task(void *param) {
+    while (1) {
+        if (is_mqtt_start) {
+            fx_cloud_task_run();   // clean and simple
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+void wifi_init(void)
+{
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      ESP_ERROR_CHECK(nvs_flash_erase());
+      ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    ESP_LOGI(TAG, "init nvs flash sucess");
+
+    //init tcp/ip stack
+    ESP_ERROR_CHECK(esp_netif_init());
+
+    //init event loop
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    //init wifi as station mode
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &my_wifi_event,
+                                                        NULL,
+                                                        &instance_any_id));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &my_ip_event,
+                                                        NULL,
+                                                        &instance_got_ip));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_LOST_IP,
+                                                        &my_ip_event,
+                                                        NULL,
+                                                        &instance_got_ip));
+    
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
+    ESP_ERROR_CHECK(esp_wifi_start() );
+
+    ESP_LOGE(TAG, "starting wifi.........");
+
+    //init mqtt client
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = M_BROKER_URL,
+        .credentials.username = M_ACCES_TOKEN
+    };
+    client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+}
+
+void fx_cloud_task_run(void) {
+    // 1. Send normal telemetry
+    mqtt_send_telemetry(gas_ppm, flame_detected);
+
+    // 2. Gas Alert
+    if (gas_ppm >= GAS_DANGER_THRESHOLD && !gas_alert_sent) {
+
+        esp_mqtt_client_publish(client,
+                                "v1/devices/me/attributes",
+                                "{\"gas_alert\":true}",
+                                0, 1, 1);
+
+        esp_mqtt_client_publish(client,
+                                "v1/devices/me/telemetry",
+                                "{\"alert_msg\":true}",
+                                0, 1, 1);
+
+        ESP_LOGE(TAG, "GAS DANGER ALERT SENT");
+        gas_alert_sent = true;
+    }
+
+    if (gas_ppm < GAS_WARNING_THRESHOLD) {
+        gas_alert_sent = false;
+    }
+
+    // 3. Flame Alert
+    if (flame_detected && !flame_alert_sent) {
+
+        esp_mqtt_client_publish(client,
+                                "v1/devices/me/attributes",
+                                "{\"flame_alert\":true}",
+                                0, 1, 0);
+
+        esp_mqtt_client_publish(client,
+                                "v1/devices/me/telemetry",
+                                "{\"alert_msg\":false}",
+                                0, 1, 1);
+
+        ESP_LOGE(TAG, "FLAME ALERT SENT");
+        flame_alert_sent = true;
+    }
+
+    if (!flame_detected) {
+        flame_alert_sent = false;
+    }
+}
+
+void app_main(void){
+    // Init hardware
+    fx_init_alarm();
+    fx_init_flame_sensor();
+    fx_init_gas_sensor();
+    fx_disable_all();
+
+
+    // Initialize WiFi and MQTT
+    wifi_init();
+
+    // Create FreeRTOS tasks
+    xTaskCreate(fx_gas_task, "Gas Task", 8192 , NULL, 10, &gasTaskHandle);
+    xTaskCreate(fx_alarm_task, "Alarm Task", 2048, NULL, 6, &alarmTaskHandle);
+    xTaskCreate(fx_flame_task, "Flame Task", 8192, NULL, 7, NULL);
+    xTaskCreate(fx_mqtt_task, "MQTT Task", 8192, NULL, 5, NULL);
+    xTaskCreate(fx_button_task, "Button Task", 2048, NULL, 9, NULL);  
+
+}
